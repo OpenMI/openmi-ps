@@ -9,11 +9,11 @@
 #include <memory>
 #include <string>
 
-#include "gen-thrift/gen-cpp/Ps.h" 
-#include "gen-thrift/gen-cpp/ps_types.h"
+#include "openmi/gen-cpp/Ps.h" 
+#include "openmi/gen-cpp/ps_types.h"
 
-//#include "model_manager.h"
-//#include "session.h"
+#include "model_manager.h"
+#include "ps/ps_session.h"
 
 using namespace openmi::thrift;
 
@@ -26,19 +26,47 @@ public:
   
   ~PsHandler();
 
-  void Pull(std::vector<std::string>& rsps, const std::vector<std::string>& names, const std::vector<std::string>& reqs, const std::string& val_type, const int64_t log_id) override;
+  void Pull(std::vector<std::string>& _return, 
+            const std::string& name, 
+            const std::vector<std::string>& reqs, 
+            const std::string& value_type, 
+            const std::string& req_id) override;
 
-  void Push(const std::vector<std::string>& names, const std::vector<std::string>& reqs, const std::string& val_type, const int32_t epoch, const int64_t log_id) override; 
+  void Push(const std::string& name, 
+            const std::vector<std::string>& reqs, 
+            const std::string& value_type, 
+            const int32_t epoch, 
+            const std::string& req_id) override;
+  
+  void Create(std::string& _return, 
+              const std::string& graph_def, 
+              const bool pb_binary=true) override;
+  
+  void ModelDef(std::string& _return, 
+                const std::string& name, 
+                const bool pb_binary=true) override;
 
-  void Create(std::vector<std::string>& names, const std::string& name, const std::vector<std::string>& pb_defs, bool pb_binary) override;
+  // dump online
+  void Dump(const std::string& name, 
+            const std::string& path, 
+            const std::string& val_type, 
+            const std::string& format, 
+            const bool dump_zero) override;
+  
+  // void DumpToHdfs();
 
+  void DumpAll(const std::string& val_type, 
+               const std::string& format, 
+               const bool dump_zero) override;
+
+  void Load(const std::string& name, 
+            const std::string& path) override;
+  
   void Drop(const std::string& name) override;
 
-  void Dump(const std::vector<std::string>& names, const std::string& path, const std::string& val_type, const std::string& format, const bool dump_zero) override;
-
-  void DumpAll(const std::string& val_type, const std::string& format, const bool dump_zero) override;
-
-  void Load(const std::string& name, const std::string& path) override;
+  void Move(const std::string& from_name, 
+            const std::string& to_name, 
+            const std::string& backup_name) override;
 
   void RestoreModels() override;
 
@@ -48,11 +76,7 @@ public:
 
   void Stat(std::vector<std::string>& stats, const std::vector<std::string>& names) override;
 
-  void ListModels(std::vector<ModelInfo>& models) override;
-
-  void Move(const std::string& from_name, const std::string& to_name, const std::string& backup_name) override;
-
-  void ModelDef(std::string& model_def, const std::string& name, const bool pb_binary=false) override;
+  void ListModels(std::vector<std::string>& models) override;
 
   void ServingType(std::string& serving_type) override;
 
@@ -63,13 +87,12 @@ public:
   void Mode(std::string& rsp) override;
 
 private:
-  //void InitSessionModels(std::shared_ptr<PsSession> session);
-
-  //PsSessionPtr GetSession(const std::vector<std::string>& names);
+  PsSessionPtr GetSession(const std::string& name);
+  int InitSession(PsSessionPtr session);
 
 private:
   std::string mode_;
-  //std::shared_ptr<ModelManager> model_manager_;  // model manager
+  ModelManagerPtr model_manager_;  // model manager
 };
 
 }} // namespace

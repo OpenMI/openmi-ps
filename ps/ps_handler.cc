@@ -11,17 +11,23 @@
 #include <gflags/gflags.h>
 #include <google/protobuf/text_format.h>
 #include <gperftools/malloc_extension.h>
+#include "base/file_op.h"
 #include "base/logging.h"
-#include "base//timer.h"
+#include "base/protobuf_op.h"
 #include "base/read_op.h" // MMap
 #include "base/shell_util.h"
+#include "base/thread_local.h"
+#include "base/timer.h"
+#include "base/write_op.h"
+#include "openmi/idl/proto/communication.pb.h"
+#include "openmi/idl/proto/model.pb.h"
 using namespace openmi;
 
 DEFINE_string(ckpt_basepath, "", "model checkpoint path");
-DEFINE_string(ckpt_summarypath, "", "ckpt meta path");
+DEFINE_string(ckpt_summarypath, "", "checkpoint meta path");
 
-DEFINE_bool(online_serving, false, "start ps for online serving");
-DEFINE_string(serving_type, "offline", "ps serving type. offline | online | nearline");
+DEFINE_bool(online_ps, false, "start ps for online predictor serving");
+DEFINE_string(ps_type, "offline", "ps serving type. offline | online | nearline");
 
 inline size_t SizeSum(const std::vector<std::string>& str_list) {
   size_t size = 0;
@@ -35,61 +41,71 @@ namespace openmi {
 namespace ps {
 
 PsHandler::PsHandler(std::string& mode): mode_(mode) { 
-  //model_manager_ = std::make_shared<ModelManager>();
-  if (FLAGS_online_serving) {
-    FLAGS_serving_type = "online";
-    if (FLAGS_ckpt_summarypath != "") {
+  model_manager_ = std::make_shared<ModelManager>();
+  if (FLAGS_online_ps) {
+    FLAGS_ps_type = "online";
+    if (FLAGS_ckpt_basepath != "") {
       RestoreModels();    // 如果模型ckpt路径存在，在线PS模式下 直接重新加载模型
     }
   }
 }
   
 PsHandler::~PsHandler() {}
-/*
-void PsHandler::InitSessionModels(std::shared_ptr<PsSession> session) {
-  session->ClearModels();
-  ModelGroupPtr model_group;
-  std::vector<size_t> model_indexes;
-  std::vector<size_t> data_indexes;
-  auto& names = session->ModelNames();
-  for (size_t i = 0; i < names.size(); ++i) {
-    thrift::ModelInfo model_info;
-    auto next_model_group = model_manager_->GetModel(model_info, names[i]);
-    if (model_group && next_model_group != model_group) {
-      session->AddModelGroup(model_group, model_indexes, data_indexes);
-      model_indexes.clear();
-      data_indexes.clear();
-    }
-    model_group = next_model_group;
-    model_indexes.push_back(model_info.model_index);
-    data_indexes.push_back(i);
+
+int PsHandler::InitSession(PsSessionPtr session) {
+  auto name = session->Name();
+  auto model = model_manager_->GetModel(name);
+  if (model == nullptr) {
+    LOG(ERROR) << __FUNCTION__ << ". name '" << name << "' not exist in model manager.";
+    return -1;
   }
-  session->AddModelGroup(model_group, model_indexes, data_indexes);
+  session->Init(model);
+  return 0;
 }
 
-PsSessionPtr PsHandler::GetSession(const std::vector<std::string>& names) {
+PsSessionPtr PsHandler::GetSession(const std::string& name) {
   //static thread_local std::unordered_map<std::string, PsSessionPtr>* sessions = nullptr;  // TODO for linux
-  static std::unordered_map<std::string, PsSessionPtr>* sessions = nullptr;
-  if (!sessions) {
-    sessions = new std::unordered_map<std::string, PsSessionPtr>();
+  static openmi::ThreadLocal<std::unordered_map<std::string, PsSessionPtr>*> sessions;
+  if (sessions.Value() == nullptr) {
+    sessions.Value() = new std::unordered_map<std::string, PsSessionPtr>();
   }
-  std::string sign = boost::join(names, ",");
+  auto& value = sessions.Value();
   PsSessionPtr session;
-  auto it = sessions->find(sign);
-  if (it == sessions->end()) {
-    session = std::make_shared<PsSession>(names);
-    (*sessions)[sign] = session;
+  auto it = value->find(name);
+  if (it == value->end()) {
+    session = std::make_shared<PsSession>(name);
+    value->insert({name, session});
   } else {
     session = it->second;
   }
-  InitSessionModels(session);
+  if (InitSession(session) != 0) {
+    LOG(INFO) << __FUNCTION__ << " init session failed.";
+    return nullptr;
+  }
   return session;
 } // GetSession
-*/
 
-void PsHandler::Pull(std::vector<std::string>& rsps, const std::vector<std::string>& names, const std::vector<std::string>& reqs, const std::string& val_type, const int64_t log_id) {
+void PsHandler::Pull(std::vector<std::string>& _return, 
+                     const std::string& name, 
+                     const std::vector<std::string>& reqs, 
+                     const std::string& value_type, 
+                     const std::string& req_id) {
+  try {
+    Timer time;
+    auto session = GetSession(name);
+    if (session == nullptr) {
+      throw std::runtime_error("session is null. it maybe model not exists. name:" + name);
+    }
+    session->Pull(_return, reqs, value_type, req_id);
+    LOG(INFO) << __FUNCTION__ << " value:" << value_type << ", name:" << name << ", time:" << time.Elapsed();
+  } catch (std::exception& e) {
+    LOG(ERROR) << __FUNCTION__ << " Exception: " << e.what();
+    throw;
+  } catch (...) {
+    LOG(ERROR) << __FUNCTION__ << " Unknown exception!!!";
+    throw;
+  }
   /*
-  SetLogId(log_id);
   try {
     Timer t;
     if (reqs.size() != SHARD_NUM) {
@@ -98,9 +114,9 @@ void PsHandler::Pull(std::vector<std::string>& rsps, const std::vector<std::stri
     pb::ValType vt;
     if (!ValType_Parse(val_type, &vt)) {
       throw std::runtime_error("Unknown val_type[" + val_type + "]. It must be one of [PARAMS, WEIGHTS, GRADS]");
-    } else if (FLAGS_online_serving && vt != pb::WEIGHTS) {
+    } else if (FLAGS_online_ps && vt != pb::WEIGHTS) {
       throw std::runtime_error("Can not pull val_type[" + val_type + "] from online serving ps. It must be 'WEIGHTS'!!!");
-    } else if (!FLAGS_online_serving && (vt != pb::WEIGHTS && vt != pb::PARAMS)) {
+    } else if (!FLAGS_online_ps && (vt != pb::WEIGHTS && vt != pb::PARAMS)) {
       throw std::runtime_error("Can not pull val_type[" + val_type + "] from offline training ps. It must be one of [WEIGHTS, PARAMS]!!!");
     }
     auto session = GetSession(names);
@@ -118,7 +134,19 @@ void PsHandler::Pull(std::vector<std::string>& rsps, const std::vector<std::stri
   */
 }
 
-void PsHandler::Push(const std::vector<std::string>& names, const std::vector<std::string>& reqs, const std::string& val_type, const int32_t epoch, const int64_t log_id) {
+void PsHandler::Push(const std::string& name, const std::vector<std::string>& reqs, const std::string& value_type, const int32_t epoch, const std::string& req_id) {
+  try {
+    Timer time;
+    auto session = GetSession(name);
+    session->Push(reqs, value_type, req_id);
+    LOG(INFO) << __FUNCTION__ << " value:" << value_type << ", name:" << name << ", time:" << time.Elapsed();
+  } catch (std::exception& e) {
+    LOG(ERROR) << __FUNCTION__ << " std::exception " << e.what();
+    throw;
+  } catch (...) {
+    LOG(ERROR) << __FUNCTION__ << " unknown exception!!!";
+    throw;
+  }
   /*
   SetLogId(log_id);
   try {
@@ -129,9 +157,9 @@ void PsHandler::Push(const std::vector<std::string>& names, const std::vector<st
     pb::ValType vt;
     if (!ValType_Parse(val_type, &vt)) {
       throw std::runtime_error("Unknown val_type[" + val_type + "]. It must be one of [WEIGHTS, PARAMS, GRADS].");
-    } else if (FLAGS_online_serving && vt != pb::WEIGHTS) {
+    } else if (FLAGS_online_ps && vt != pb::WEIGHTS) {
       throw std::runtime_error("Can not push " + val_type + " to online serving ps!!! It muse be WEIGHTS!!!");
-    } else if (!FLAGS_online_serving && (vt != pb::GRADS && vt != pb::PARAMS)) {
+    } else if (!FLAGS_online_ps && (vt != pb::GRADS && vt != pb::PARAMS)) {
       throw std::runtime_error("Can not push " + val_type + " to offline serving ps!!! It must be one of [GRADS, PARAMS]!!!");
     }
     auto session = GetSession(names);
@@ -147,12 +175,11 @@ void PsHandler::Push(const std::vector<std::string>& names, const std::vector<st
   */
 } // Push
 
-void PsHandler::Create(std::vector<std::string>& names, const std::string& name, const std::vector<std::string>& pb_defs, bool pb_binary) {
-  /*
+void PsHandler::Create(std::string& _return, const std::string& graph_def, bool pb_binary) {
   try {
     Timer t;
-    names = model_manager_->Create(name, pb_defs, pb_binary);
-    LOG(WARNING) << "create t " << t.Elapsed() << " group[" << name << "] models[" << boost::join(names, ",") << "]";
+    _return = model_manager_->Create(graph_def, pb_binary);
+    LOG(WARN) << "create model. name '" << _return << "' time: " << t.Elapsed();
   } catch (std::exception& e) {
     LOG(ERROR) << __FUNCTION__ << " std::exception: " << e.what();
     throw;
@@ -160,38 +187,112 @@ void PsHandler::Create(std::vector<std::string>& names, const std::string& name,
     LOG(ERROR) << __FUNCTION__ << " unknown exception";
     throw;
   }
-  */
-} // Create
+}
 
-void PsHandler::Drop(const std::string& name) {
-  /*
-  LOG(INFO) << "PsHandler::Drop ...";
+void PsHandler::ModelDef(std::string& _return, const std::string& name, const bool pb_binary) {
   try {
     Timer t;
-    model_manager_->Drop(name);
-    MallocExtension::instance()->ReleaseFreeMemory();
-    LOG(WARNING) << "drop t=" << t.Elapsed() << " " << name;
-  } catch (std::exception &e) {
+    model_manager_->GetModelDef(_return, name, pb_binary);
+    LOG(WARN) << "get model def. name '" << name << "' time: " << t.Elapsed();
+  } catch (std::exception& e) {
     LOG(ERROR) << __FUNCTION__ << " std::exception: " << e.what();
     throw;
   } catch (...) {
     LOG(ERROR) << __FUNCTION__ << " unknown exception";
     throw;
   }
-  */
+}
+
+void PsHandler::Drop(const std::string& name) {
+  try {
+    Timer t;
+    model_manager_->Drop(name);
+    MallocExtension::instance()->ReleaseFreeMemory();
+    LOG(WARN) << __FUNCTION__ << " name:" << name << ", time:" << t.Elapsed();
+  } catch (std::exception& e) {
+    LOG(ERROR) << __FUNCTION__ << " std::exception:" << e.what();
+    throw;
+  } catch (...) {
+    LOG(ERROR) << __FUNCTION__ << " unknown exception.";
+    throw;
+  }
 } // Drop
 
-void PsHandler::Dump(const std::vector<std::string>& names, const std::string& path, const std::string& _val_type, const std::string& _format, const bool dump_zero) {
+// online ps: weight
+// other ps: checkpoint
+void PsHandler::Dump(const std::string& name, const std::string& path, const std::string& val_type, const std::string& format, const bool dump_zero) {
   LOG(INFO) << "PsHandler::Dump ...";
+  try {
+    Timer time;
+    proto::ModelValueType value_type;
+    if (!proto::ModelValueType_Parse(val_type, &value_type)) {
+      throw std::runtime_error("Dump. Unkown value_type:" + val_type);
+    }
+    if (FLAGS_online_ps && value_type != proto::WEIGHT) {
+      throw std::runtime_error("online ps can't dump value_type'" + 
+        proto::ModelValueType_Name(value_type) + "'. It must be WEIGHT!");
+    }
+    if (!FLAGS_online_ps && (value_type != proto::WEIGHT && value_type != proto::CHECKPOINT)) {
+      throw std::runtime_error("offline ps can't dump value_type'" + 
+        proto::ModelValueType_Name(value_type) + "'. It must be one of [WEIGHT, CHECKPOINT]!");
+    }
+    auto session = GetSession(name);
+    session->Dump(path, value_type, format, dump_zero);
+
+    // 更新checkpoint.meta
+    bool add_to_ckpt_meta = true;
+    proto::CheckpointMeta ckpt_meta;
+    std::string ckpt_meta_path = FLAGS_ckpt_basepath + "/checkpoint.meta";
+    if (FileOp::access_file(ckpt_meta_path.c_str())) {
+      if (ProtobufOp::LoadObjectFromPbFile<proto::CheckpointMeta>(ckpt_meta_path.c_str(), &ckpt_meta) != 0) {
+        LOG(ERROR) << "parse checkpoint meta from file failed.";
+        return;
+      } 
+
+      for (int i = 0; i < ckpt_meta.model_meta_size(); ++i) {
+        if (name == ckpt_meta.model_meta(i).model_name()) {
+          add_to_ckpt_meta = false;
+          break;
+        }
+      }
+    }
+
+    if (add_to_ckpt_meta) {
+      if (!FileOp::access_dir(FLAGS_ckpt_basepath.c_str())) {
+        if (!FileOp::mk_dir(FLAGS_ckpt_basepath.c_str())) {
+          LOG(ERROR) << "mkdir failed. path:" << FLAGS_ckpt_basepath;
+          return;
+        }
+      }
+
+      proto::DumpModelMeta* dump_meta = ckpt_meta.add_model_meta();
+      dump_meta->set_model_name(name);
+      dump_meta->set_path(path);
+      dump_meta->set_value_type(proto::WEIGHT);
+      
+      Write write(ckpt_meta_path.c_str());
+      std::string ckpt = ckpt_meta.DebugString();
+      write.write(ckpt.c_str(), ckpt.size());
+      write.close();
+    }
+
+    LOG(WARN) << __FUNCTION__ << " name:" << name << ", time:" << time.Elapsed();
+  } catch (std::exception& e) {
+    LOG(ERROR) << __FUNCTION__ << " std::exception:" << e.what();
+    throw;
+  } catch (...) {
+    LOG(ERROR) << __FUNCTION__ << " unknown exception";
+    throw;
+  }
   /*
   try {
     Timer t;
     pb::ValType val_type;
     if (!ValType_Parse(_val_type, &val_type)) {
       throw std::runtime_error("Unknown val_type[" + _val_type + "]!!!");
-    } else if (FLAGS_online_serving && val_type != pb::WEIGHTS) {
+    } else if (FLAGS_online_ps && val_type != pb::WEIGHTS) {
       throw std::runtime_error("Can not dump " + pb::ValType_Name(val_type) + " from online serving ps!!! It muse be WEIGHTS.");
-    } else if (!FLAGS_online_serving && (val_type != pb::WEIGHTS && val_type != pb::PARAMS)) {
+    } else if (!FLAGS_online_ps && (val_type != pb::WEIGHTS && val_type != pb::PARAMS)) {
       throw std::runtime_error("Can not dump " + pb::ValType_Name(val_type) + " from offline serving ps!!! It muse be one of [WEIGHTS, PARAMS].");
     }
     pb::Format format;
@@ -206,7 +307,7 @@ void PsHandler::Dump(const std::vector<std::string>& names, const std::string& p
     auto session = GetSession(names);
     session->Dump(meta);
     session->ClearModels();
-    LOG(WARNING) << "dump t " << t.Elapsed() << " " << val_type << " " << format << " path: " << path << " " << session->Signature();
+    LOG(WARN) << "dump t " << t.Elapsed() << " " << val_type << " " << format << " path: " << path << " " << session->Signature();
   } catch (std::exception &e) {
     LOG(ERROR) << __FUNCTION__ << " std::exception: " << e.what();
     throw;
@@ -273,31 +374,31 @@ void PsHandler::DumpAll(const std::string& val_type, const std::string& format, 
   */
 } // DumpAll
 
+// load from local 
 void PsHandler::Load(const std::string& name, const std::string& path) {
-  LOG(INFO) << "PsHandler::Load ...";
-  /*
   try {
-    Timer t;
-    tools::MMap mmap;
-    pb::DumpMeta meta;
-    google::protobuf::TextFormat::ParseFromString(mmap.TextContent(path + ".meta"), &meta);
-    pb::ValType val_type = meta.val_type();
-    if (FLAGS_online_serving && val_type != pb::WEIGHTS) {
-      throw std::runtime_error("Can not load " + pb::ValType_Name(val_type) + " from online serving ps!!! It must be WEIGHTS!!!");
-    } else if (!FLAGS_online_serving && val_type != pb::PARAMS) {
-      throw std::runtime_error("Can not load " + pb::ValType_Name(val_type) + " from offline training ps!!! It muse be PARAMS!!!");
+    Timer time;
+    if (model_manager_->IsExist(name)) {
+      LOG(WARN) << "model '" << name << "' has exists. it can't load from path:" << path;
+      return;
     }
-    meta.set_path(path);
-    std::vector<std::string> model_defs;
-    for (auto& def: meta.model_defs()) {
-      model_defs.push_back(def.DebugString());
+
+    auto graph_def_path = path + "/" + name + ".graph";
+    proto::GraphDef gdef;
+    if (ProtobufOp::LoadObjectFromPbFile<proto::GraphDef>(graph_def_path.c_str(), &gdef) != 0) {
+      LOG(ERROR) << "load proto object from file failed. path:" << graph_def_path;
+      return;
     }
-    // FIXME: dumped model should also be serialized binary string 
-    auto names = model_manager_->Create(name, model_defs, false);
-    auto session = GetSession(names);
-    session->Load(meta);
-    session->ClearModels();
-    LOG(WARNING) << "load t " << t.Elapsed() << " " << name << " path: " << path;
+    // TODO: dumped model should also be serialized binary string and md5
+    auto model_name = model_manager_->Create(gdef.DebugString(), false);
+    if (name != model_name) {
+      LOG(WARN) << "name != model_name in graph";
+    }
+
+    auto session = GetSession(name);
+    session->Load(path, proto::WEIGHT, "format");
+
+    LOG(WARN) << "load time:" << time.Elapsed() << " " << name << " path: " << path;
   } catch (std::exception &e) {
     LOG(ERROR) << __FUNCTION__ << " std::exception: " << e.what();
     throw;
@@ -305,25 +406,35 @@ void PsHandler::Load(const std::string& name, const std::string& path) {
     LOG(ERROR) << __FUNCTION__ << " unknown exception.";
     throw;
   }
-  */
 } // Load 
 
-void PsHandler::RestoreModels() {  
-  LOG(INFO) << "PsHandler::RestoreModels ...";
-  /*
-  Timer t;
-  pb::CkptMeta ckptmeta;
+void PsHandler::RestoreModels() {
+  Timer time;
+  proto::CheckpointMeta ckpt_meta;
   try {
-    tools::MMap mmap;
-    google::protobuf::TextFormat::ParseFromString(mmap.TextContent(FLAGS_ckpt_summarypath), &ckptmeta);
+    if (!FileOp::access_dir(FLAGS_ckpt_basepath.c_str())) {
+      LOG(WARN) << "checkpoint basepath can not access it. path:" << FLAGS_ckpt_basepath;
+      return;
+    }
+    std::string ckpt_meta_path = FLAGS_ckpt_basepath + "/checkpoint.meta";
+    if (ProtobufOp::LoadObjectFromPbFile<proto::CheckpointMeta>(ckpt_meta_path.c_str(), &ckpt_meta) != 0) {
+      LOG(ERROR) << "load checkpoint meta from file failed. path:" << ckpt_meta_path;
+      return;
+    }
+    for (int i = 0; i < ckpt_meta.model_meta_size(); ++i) {
+      auto model_meta = ckpt_meta.model_meta(i);
+      LOG(INFO) << "load model info:\n" << model_meta.DebugString();
+      Load(model_meta.model_name(), model_meta.path());
+      LOG(INFO) << "load model done. model name:" << model_meta.model_name();
+    }
+    LOG(INFO) << __FUNCTION__ << ". time:" << time.Elapsed();
   } catch (std::exception &e) {
     LOG(ERROR) << __FUNCTION__ << " std::exception: " << e.what();
     throw;
   } catch (...) {
-    LOG(ERROR) << __FUNCTION__ << " unknown exception,";
+    LOG(ERROR) << __FUNCTION__ << " unknown exception.";
     throw;
   }
-  */
 } // RestoreModels 
 
 void PsHandler::SetStreamingUpdate(const std::vector<std::string>& names, const bool streaming_update) {
@@ -334,7 +445,7 @@ void PsHandler::SetStreamingUpdate(const std::vector<std::string>& names, const 
     auto session = GetSession(names);
     session->SetStreamingUpdate(streaming_update);
     session->ClearModels();
-    LOG(WARNING) << "set streaming t " << t.Elapsed() << " " << session->Signature();
+    LOG(WARN) << "set streaming t " << t.Elapsed() << " " << session->Signature();
   } catch (std::exception &e) {
     LOG(ERROR) << __FUNCTION__ << " std::exception: " << e.what();
     throw;
@@ -383,13 +494,11 @@ void PsHandler::Stat(std::vector<std::string>& stats, const std::vector<std::str
   */
 } // Stat
 
-void PsHandler::ListModels(std::vector<ModelInfo>& models) {
-  LOG(INFO) << "PsHandler::ListModels ...";
-  /*
+void PsHandler::ListModels(std::vector<std::string>& models) {
   try {
-    Timer t;
+    Timer time;
     model_manager_->ListModels(models);
-    LOG(WARNING) << "list_models t " << t.Elapsed();
+    LOG(WARN) << __FUNCTION__ << " time: " << time.Elapsed();
   } catch (std::exception& e) {
     LOG(ERROR) << __FUNCTION__ << " std::exception: " << e.what();
     throw;
@@ -397,15 +506,14 @@ void PsHandler::ListModels(std::vector<ModelInfo>& models) {
     LOG(ERROR) << __FUNCTION__ << " unknown exception";
     throw;
   }
-  */
 } // ListModels
 
 void PsHandler::Move(const std::string& from_name, const std::string& to_name, const std::string& backup_name) {
-  /*
   try {
-    Timer t;
+    Timer time;
     model_manager_->Move(from_name, to_name, backup_name);
-    LOG(WARNING) << "move t=" << t.Elapsed();
+    LOG(WARN) << __FUNCTION__ <<  " from[" << from_name << "], to[" 
+              << to_name << "], backup[" << backup_name << "], time:" << time.Elapsed(); 
   } catch (std::exception& e) {
     LOG(ERROR) << __FUNCTION__ << " std::exception: " << e.what();
     throw;
@@ -413,34 +521,17 @@ void PsHandler::Move(const std::string& from_name, const std::string& to_name, c
     LOG(ERROR) << __FUNCTION__ << " Unknown exception";
     throw;
   }
-  */
 } // Move
-
-void PsHandler::ModelDef(std::string& model_def, const std::string& name, const bool pb_binary) {
-  /*
-  try {
-    Timer t;
-    model_manager_->ModelDef(model_def, name, pb_binary);
-    LOG(WARNING) << "model_def t=" << t.Elapsed() << " " << name;
-  } catch (std::exception& e) {
-    LOG(ERROR) << __FUNCTION__ << " std::exception: " << e.what();
-    throw;
-  } catch (...) {
-    LOG(ERROR) << __FUNCTION__ << " unknown exception";
-    throw;
-  }
-  */
-}
 
 void PsHandler::ServingType(std::string& serving_type) {
   try {
     Timer t;
-    if (FLAGS_online_serving) {
+    if (FLAGS_online_ps) {
       serving_type = "online";
     } else {
-      serving_type = FLAGS_serving_type;
+      serving_type = FLAGS_ps_type;
     }
-    LOG(WARNING) << "serving_type t " << t.Elapsed(); 
+    LOG(WARN) << "serving_type t" << t.Elapsed(); 
   } catch (std::exception& e) {
     LOG(ERROR) << __FUNCTION__ << " std::exception: " << e.what();
     throw;
@@ -453,13 +544,13 @@ void PsHandler::ServingType(std::string& serving_type) {
 void PsHandler::ExecShell(std::vector<std::string>& outputs, const std::vector<std::string>& cmds) {
   try {
     Timer t;
-    if (!FLAGS_online_serving) {
+    if (!FLAGS_online_ps) {
       for (auto& cmd: cmds) {
         int ret = openmi::Exec(cmd, outputs);
         if (ret != 0) break;
       }
     }
-    LOG(WARNING) << "exec_shell t " << t.Elapsed();
+    LOG(WARN) << "exec_shell t " << t.Elapsed();
   } catch (std::exception& e) {
     LOG(ERROR) << __FUNCTION__ << " std::exception: " << e.what();
     throw;

@@ -3,6 +3,7 @@
 #include <sys/stat.h>
 
 #include <boost/shared_ptr.hpp>
+#include <gflags/gflags.h>
 //#include <glog/logging.h>
 #include <thrift/concurrency/ThreadManager.h>
 #include <thrift/concurrency/PosixThreadFactory.h>
@@ -29,6 +30,7 @@ void init_log(const char* name, const char* log_dir) {
 }
 
 int main(int argc, char** argv) {
+  google::ParseCommandLineFlags(&argc, &argv, true);
   init_log(argv[0], "./log");
   int num_thread = 2;
   int num_io_thread = 1;

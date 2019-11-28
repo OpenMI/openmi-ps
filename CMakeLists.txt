@@ -43,7 +43,9 @@ set(DYNAMIC_LINKER "-Wl,--dynamic-linker=${DEPS_DYNAMIC_LINKER}")
 set(summary_linker_flags "${STATIC_LINKER_FLAGS} ${SHARED_LINKER_FLAGS} ${DYNAMIC_LINKER}")
 
 aux_source_directory(ps srcs_ps)
+aux_source_directory(ps/internal srcs_ps_internal)
 set(srcs ${srcs_ps})
+list(APPEND srcs ${srcs_ps_internal})
 
 set(libname openmi_ps)
 #add_library(${libname} SHARED ${srcs})

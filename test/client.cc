@@ -11,7 +11,6 @@ using namespace openmi::thrift;
 #include <boost/lexical_cast.hpp>
 #include <boost/shared_ptr.hpp>
 #include <gflags/gflags.h>
-//#include <glog/logging.h>
 
 DEFINE_string(hosts, "localhost", "ps cluster hostname list");
 DEFINE_string(ports, "4321", "ps port list");
@@ -19,7 +18,6 @@ DEFINE_int32(conn_timeout, 100, "connection timeout");
 DEFINE_int32(timeout, 500, "send/recv timeout");
 
 void init_log(const char* name, const char* log_dir) {
-  mkdir(log_dir, 0777);
   InitLogging(name, log_dir);
   g_alsologtostderr = false;
   g_log_severity = INFO;
